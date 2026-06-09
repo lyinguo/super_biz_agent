@@ -28,6 +28,7 @@ from app.agent.mcp_client import (
     suggest_mcp_transport,
 )
 from app.services.memory_summary_service import memory_summary_service
+from app.services.solution_capture_service import solution_capture_service
 
 # 阿里千问大模型和langchain集成参考： https://docs.langchain.com/oss/python/integrations/chat/qwen
 # 注意：需要配置环境变量 DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1 否则默认访问的是新加坡站点
@@ -156,13 +157,38 @@ class RagAgentService:
             logger.info(f"可用工具列表: {', '.join(tool_names)}")
 
     async def _maybe_compress_session_memory(self, session_id: str) -> None:
-        """在对话前按需压缩当前 session 的历史记忆."""
+        """同步模式：在对话前按需压缩当前 session 的历史记忆."""
+        if config.memory_summary_strategy.lower() != "sync":
+            return
+
         compressed = await memory_summary_service.maybe_compress_agent_state(
             agent=self.agent,
             session_id=session_id,
         )
         if compressed:
-            logger.info(f"[会话 {session_id}] 已完成历史记忆压缩")
+            logger.info(f"[会话 {session_id}] 已完成同步历史记忆压缩")
+
+    def _schedule_session_memory_compression(self, session_id: str) -> None:
+        """异步模式：在对话完成后调度后台历史压缩."""
+        if config.memory_summary_strategy.lower() != "async":
+            return
+
+        scheduled = memory_summary_service.schedule_compress_agent_state(
+            agent=self.agent,
+            session_id=session_id,
+        )
+        if scheduled:
+            logger.info(f"[会话 {session_id}] 已调度异步历史记忆压缩")
+
+    def _schedule_solution_capture(self, session_id: str, question: str, answer: str) -> None:
+        """对话完成后异步沉淀可复用解决方案."""
+        scheduled = solution_capture_service.schedule_capture(
+            session_id=session_id,
+            question=question,
+            answer=answer,
+        )
+        if scheduled:
+            logger.info(f"[会话 {session_id}] 已调度解决方案沉淀")
 
     def _build_system_prompt(self) -> str:
         """
@@ -250,6 +276,8 @@ class RagAgentService:
                     logger.info(f"[会话 {session_id}] Agent 调用了工具: {tool_names}")
 
                 logger.info(f"[会话 {session_id}] RAG Agent 查询完成（非流式）")
+                self._schedule_session_memory_compression(session_id)
+                self._schedule_solution_capture(session_id, question, answer)
                 return answer
 
             logger.warning(f"[会话 {session_id}] Agent 返回结果为空")
@@ -301,6 +329,8 @@ class RagAgentService:
                 }
             }
         
+            full_response = ""
+
             #流式，产生一个字，就进行输出，相当于一个  生产者-消费者模型
             async for token, metadata in self.agent.astream(
                 input=agent_input,
@@ -318,6 +348,7 @@ class RagAgentService:
                             if isinstance(block, dict) and block.get('type') == 'text':
                                 text_content = block.get('text', '')
                                 if text_content:
+                                    full_response += text_content
                                     yield {
                                         "type": "content",
                                         "data": text_content,
@@ -325,6 +356,8 @@ class RagAgentService:
                                     }
 
             logger.info(f"[会话 {session_id}] RAG Agent 查询完成（流式）")
+            self._schedule_session_memory_compression(session_id)
+            self._schedule_solution_capture(session_id, question, full_response)
             yield {"type": "complete"}
 
         except Exception as e:

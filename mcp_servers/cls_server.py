@@ -6,6 +6,8 @@
 import logging
 import functools
 import json
+import re
+from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from fastmcp import FastMCP
@@ -18,6 +20,41 @@ logging.basicConfig(
 logger = logging.getLogger("CLS_MCP_Server")
 
 mcp = FastMCP("CLS")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOG_SUFFIXES = {".log", ".out", ".err"}
+EXCLUDED_DIR_NAMES = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    "volumes",
+    "memory_summaries",
+}
+MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_SCAN_LINES_PER_FILE = 3000
+
+ANOMALY_RULES = [
+    (
+        "critical",
+        re.compile(r"\b(CRITICAL|FATAL|PANIC)\b|严重|致命", re.IGNORECASE),
+    ),
+    (
+        "error",
+        re.compile(
+            r"\b(ERROR|ERR|Exception|Traceback|failed|failure|timeout|refused|denied)\b"
+            r"|错误|异常|失败|超时|拒绝",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "warning",
+        re.compile(r"\b(WARN|WARNING)\b|警告|告警", re.IGNORECASE),
+    ),
+]
+TIMESTAMP_PATTERN = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+LOGURU_LEVEL_PATTERN = re.compile(r"\|\s*(?P<level>[A-Z]+)\s*\|")
 
 
 def log_tool_call(func):
@@ -99,6 +136,183 @@ def generate_time_series(base_time: datetime, minutes_offset: int) -> str:
     """
     result_time = base_time + timedelta(minutes=minutes_offset)
     return result_time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_safe_project_path(path: Path) -> bool:
+    """限制日志扫描只访问当前项目目录内的文件。"""
+    try:
+        path.resolve().relative_to(PROJECT_ROOT)
+        return True
+    except ValueError:
+        return False
+
+
+def should_skip_path(path: Path) -> bool:
+    """跳过虚拟环境、数据库数据目录等不适合作为业务日志扫描的路径。"""
+    return any(part in EXCLUDED_DIR_NAMES for part in path.parts)
+
+
+def discover_local_log_files() -> list[Path]:
+    """发现当前项目下可扫描的本地日志文件。"""
+    candidates: list[Path] = []
+
+    # 优先扫描项目 logs 目录，再扫描项目根目录的一层日志文件。
+    scan_roots = [PROJECT_ROOT / "logs", PROJECT_ROOT]
+    for root in scan_roots:
+        if not root.exists() or not root.is_dir():
+            continue
+
+        iterator = root.rglob("*") if root.name == "logs" else root.glob("*")
+        for path in iterator:
+            if not path.is_file():
+                continue
+            if should_skip_path(path):
+                continue
+            if path.suffix.lower() not in LOG_SUFFIXES:
+                continue
+            if not is_safe_project_path(path):
+                continue
+            candidates.append(path.resolve())
+
+    # 去重并按最近修改时间排序，最新日志排在前面。
+    unique = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
+    return unique
+
+
+def topic_id_for_path(path: Path) -> str:
+    relative_path = path.resolve().relative_to(PROJECT_ROOT).as_posix()
+    return f"local-log:{relative_path}"
+
+
+def path_for_topic_id(topic_id: str) -> Path | None:
+    """根据 topic_id 找到真实日志文件；兼容旧 topic-001，映射到最新日志。"""
+    files = discover_local_log_files()
+    if topic_id in {"topic-001", "local", "latest"}:
+        return files[0] if files else None
+
+    if topic_id.startswith("local-log:"):
+        relative = topic_id.removeprefix("local-log:")
+        path = (PROJECT_ROOT / relative).resolve()
+        if path.exists() and path.is_file() and is_safe_project_path(path):
+            return path
+
+    return None
+
+
+def infer_service_name(path: Path) -> str:
+    """从日志文件名推断一个粗略的服务名，供 Agent 选择 topic。"""
+    stem = path.stem.lower()
+    if stem.startswith("app"):
+        return "super-biz-agent"
+    if "server" in stem:
+        return "fastapi-server"
+    if "mcp" in stem:
+        return "mcp-server"
+    return stem.replace("_", "-")
+
+
+def file_topic(path: Path) -> Dict[str, Any]:
+    stat = path.stat()
+    relative_path = path.relative_to(PROJECT_ROOT).as_posix()
+    return {
+        "topic_id": topic_id_for_path(path),
+        "topic_name": path.name,
+        "service_name": infer_service_name(path),
+        "region_code": "local",
+        "create_time": datetime.fromtimestamp(stat.st_ctime).strftime("%Y-%m-%d %H:%M:%S"),
+        "update_time": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        "size_bytes": stat.st_size,
+        "path": relative_path,
+        "description": "本项目本地日志文件",
+    }
+
+
+def parse_log_timestamp(line: str) -> datetime | None:
+    match = TIMESTAMP_PATTERN.search(line)
+    if not match:
+        return None
+    timestamp_text = match.group("ts").replace("T", " ")
+    try:
+        return datetime.strptime(timestamp_text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def detect_log_level(line: str, severity: str) -> str:
+    match = LOGURU_LEVEL_PATTERN.search(line)
+    if match:
+        return match.group("level")
+    upper = line.upper()
+    for level in ("CRITICAL", "ERROR", "WARNING", "WARN", "INFO", "DEBUG"):
+        if level in upper:
+            return "WARNING" if level == "WARN" else level
+    return severity.upper() if severity != "normal" else "INFO"
+
+
+def classify_anomaly(line: str) -> tuple[bool, str, list[str]]:
+    matched_keywords: list[str] = []
+    for severity, pattern in ANOMALY_RULES:
+        matches = pattern.findall(line)
+        if matches:
+            for item in matches:
+                if isinstance(item, tuple):
+                    matched_keywords.extend(str(x) for x in item if x)
+                else:
+                    matched_keywords.append(str(item))
+            return True, severity, sorted(set(matched_keywords))
+    return False, "normal", []
+
+
+def read_recent_log_lines(path: Path, max_lines: int = MAX_SCAN_LINES_PER_FILE) -> list[tuple[int | None, str]]:
+    """读取日志尾部内容；大文件只读取最后 MAX_FILE_BYTES，避免工具调用过慢。"""
+    size = path.stat().st_size
+    if size <= MAX_FILE_BYTES:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        start_line = max(1, len(lines) - max_lines + 1)
+        return list(enumerate(lines[-max_lines:], start=start_line))
+
+    with path.open("rb") as f:
+        f.seek(max(0, size - MAX_FILE_BYTES))
+        if f.tell() > 0:
+            f.readline()
+        data = f.read()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return [(None, line) for line in lines[-max_lines:]]
+
+
+def line_matches_query(line: str, level: str, query: Optional[str]) -> bool:
+    if not query:
+        return True
+
+    query_text = query.strip()
+    if not query_text:
+        return True
+
+    lower_line = line.lower()
+    lower_query = query_text.lower()
+
+    # 支持常见的简单形式：level:ERROR、message:timeout，以及 OR 组合。
+    parts = [p.strip() for p in re.split(r"\s+OR\s+", query_text, flags=re.IGNORECASE) if p.strip()]
+    if len(parts) > 1:
+        return any(line_matches_query(line, level, part) for part in parts)
+
+    if lower_query.startswith("level:"):
+        expected = query_text.split(":", 1)[1].strip().upper()
+        return expected in level.upper() or expected in line.upper()
+
+    if lower_query.startswith("message:"):
+        expected = query_text.split(":", 1)[1].strip().lower()
+        return expected in lower_line
+
+    return lower_query in lower_line
+
+
+def in_time_range(log_time: datetime | None, start_time: int, end_time: int) -> bool:
+    if log_time is None:
+        return True
+    timestamp_ms = int(log_time.timestamp() * 1000)
+    return start_time <= timestamp_ms <= end_time
 
 
 @mcp.tool()
@@ -183,29 +397,20 @@ def get_topic_info_by_name(topic_name: str, region_code: Optional[str] = None) -
             - create_time: 创建时间
             - log_count: 日志数量
     """
-    mock_topics = [
-        {
-            "topic_id": "topic-001",
-            "topic_name": "数据同步服务日志",
-            "service_name": "data-sync-service",
-            "region_code": "ap-beijing",
-            "create_time": "2024-01-01 10:00:00",
-            "log_count": 0,
-            "description": "服务应用日志"
-        }
-    ]
+    topics = [file_topic(path) for path in discover_local_log_files()]
 
-    # 根据名称和地区筛选
-    for topic in mock_topics:
-        if topic["topic_name"] == topic_name:
-            if region_code is None or topic["region_code"] == region_code:
-                return topic
+    for topic in topics:
+        if region_code and topic["region_code"] != region_code:
+            continue
+        if topic["topic_name"] == topic_name or topic["path"] == topic_name:
+            return topic
 
     return {
         "topic_id": None,
         "topic_name": topic_name,
         "region_code": region_code,
-        "error": f"未找到主题: {topic_name}"
+        "error": f"未找到本地日志主题: {topic_name}",
+        "available_topics": topics[:10],
     }
 
 
@@ -279,67 +484,53 @@ def search_topic_by_service_name(
             end_time=current_ts
         )
     """
-    # Mock 主题数据（实际应该从配置或数据库读取）
-    mock_topics = [
-        {
-            "topic_id": "topic-001",
-            "topic_name": "数据同步服务日志",
-            "service_name": "data-sync-service",
-            "region_code": "ap-beijing",
-            "create_time": "2024-01-01 10:00:00",
-            "log_count": 0,
-            "description": "数据同步服务的应用日志，包含同步任务执行情况"
-        },
-        {
-            "topic_id": "topic-002",
-            "topic_name": "数据同步服务错误日志",
-            "service_name": "data-sync-service",
-            "region_code": "ap-beijing",
-            "create_time": "2024-01-01 10:00:00",
-            "log_count": 0,
-            "description": "数据同步服务的错误日志"
-        },
-        {
-            "topic_id": "topic-003",
-            "topic_name": "API网关服务日志",
-            "service_name": "api-gateway-service",
-            "region_code": "ap-shanghai",
-            "create_time": "2024-01-01 10:00:00",
-            "log_count": 0,
-            "description": "API网关服务日志"
-        }
-    ]
-    
+    topics = [file_topic(path) for path in discover_local_log_files()]
     matched_topics = []
-    
-    # 搜索逻辑
-    for topic in mock_topics:
-        # 地区筛选
+
+    for topic in topics:
         if region_code and topic["region_code"] != region_code:
             continue
-        
-        # 服务名称匹配
-        topic_service_name = topic.get("service_name", "")
-        
+
+        searchable_text = " ".join(
+            [
+                topic.get("service_name", ""),
+                topic.get("topic_name", ""),
+                topic.get("path", ""),
+                topic.get("description", ""),
+            ]
+        ).lower()
+        target = service_name.lower()
+
         if fuzzy:
-            # 模糊匹配：服务名包含查询字符串，或查询字符串包含服务名
-            if (service_name.lower() in topic_service_name.lower() or 
-                topic_service_name.lower() in service_name.lower()):
+            if target in searchable_text or any(part and part in searchable_text for part in target.split("-")):
                 matched_topics.append(topic)
         else:
-            # 精确匹配
-            if topic_service_name == service_name:
+            if topic.get("service_name", "").lower() == target:
                 matched_topics.append(topic)
-    
+
+    fallback_used = False
+    if not matched_topics and fuzzy:
+        # AIOps 可能传入业务服务名，但本地日志文件名未必包含该服务名。
+        # 为了让诊断仍能看到真实日志，未匹配时回退返回最新的本地日志。
+        matched_topics = topics[:5]
+        fallback_used = bool(matched_topics)
+
     return {
         "total": len(matched_topics),
         "topics": matched_topics,
         "query": {
             "service_name": service_name,
             "region_code": region_code,
-            "fuzzy": fuzzy
+            "fuzzy": fuzzy,
+            "source": "local_files",
+            "project_root": str(PROJECT_ROOT),
+            "fallback_used": fallback_used,
         },
-        "message": f"找到 {len(matched_topics)} 个匹配的日志主题" if matched_topics else f"未找到服务 '{service_name}' 的日志主题"
+        "message": (
+            f"找到 {len(matched_topics)} 个本地日志主题"
+            if matched_topics
+            else f"未找到服务 '{service_name}' 可扫描的本地日志文件"
+        ),
     }
 
 
@@ -408,62 +599,183 @@ def search_log(
             limit=100
         )
     """
-    # 根据 topic_id 返回不同的结果
-    if topic_id == "topic-001":
-        # topic-001: 应用日志，动态生成 INFO 日志
-        logs = []
-        current_time_ms = start_time
-        count = 0
-
-        # 计算最大可生成的日志条数（基于时间范围）
-        max_logs_by_time = int((end_time - start_time) / (60 * 1000)) + 1
-
-        # 实际生成的日志数量取 limit 和时间范围内最大日志数的较小值
-        actual_limit = min(limit, max_logs_by_time)
-
-        while current_time_ms <= end_time and count < actual_limit:
-            # 将毫秒时间戳转换为可读格式
-            log_time = datetime.fromtimestamp(current_time_ms / 1000)
-            time_str = log_time.strftime("%Y-%m-%d %H:%M:%S")
-
-            log_entry = {
-                "timestamp": time_str,
-                "level": "INFO",
-                "message": "正在同步元数据……"
-            }
-
-            logs.append(log_entry)
-            count += 1
-
-            # 下一条日志时间增加1分钟（60秒 * 1000毫秒）
-            current_time_ms += 60 * 1000
-
+    started_at = datetime.now()
+    path = path_for_topic_id(topic_id)
+    if path is None:
         return {
             "topic_id": topic_id,
             "start_time": start_time,
             "end_time": end_time,
             "query": query,
             "limit": limit,
-            "total": len(logs),
-            "logs": logs,
-            "took_ms": 50,
-            "message": f"成功查询 {len(logs)} 条应用日志"
-        }
-    else:
-        # 其他 topic_id: 返回错误，表示 topic 不存在
-        return {
-            "topic_id": topic_id,
-            "start_time": start_time,
-            "end_time": end_time,
-            "query": query,
-            "limit": limit,
+            "source": "local_files",
             "total": 0,
             "logs": [],
             "took_ms": 0,
-            "error": f"主题不存在: {topic_id}",
-            "message": f"错误: 未找到主题 {topic_id}，请检查 topic_id 是否正确"
+            "error": f"本地日志主题不存在或不可访问: {topic_id}",
+            "available_topics": [file_topic(p) for p in discover_local_log_files()[:10]],
+            "message": f"错误: 未找到本地日志主题 {topic_id}",
         }
 
+    limit = max(1, min(int(limit), 500))
+    logs = []
+    severity_counts: Dict[str, int] = {}
+    scanned_lines = 0
+
+    for line_number, line in read_recent_log_lines(path):
+        scanned_lines += 1
+        log_time = parse_log_timestamp(line)
+        is_anomaly, severity, matched_keywords = classify_anomaly(line)
+        level = detect_log_level(line, severity)
+
+        if not in_time_range(log_time, start_time, end_time):
+            continue
+        if not line_matches_query(line, level, query):
+            continue
+
+        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+        timestamp_ms = int(log_time.timestamp() * 1000) if log_time else None
+        logs.append(
+            {
+                "timestamp": log_time.strftime("%Y-%m-%d %H:%M:%S") if log_time else None,
+                "timestamp_ms": timestamp_ms,
+                "level": level,
+                "message": line,
+                "source_file": path.relative_to(PROJECT_ROOT).as_posix(),
+                "line_number": line_number,
+                "is_anomaly": is_anomaly,
+                "severity": severity,
+                "matched_keywords": matched_keywords,
+            }
+        )
+
+    # 最新日志通常更有价值，返回尾部命中的 limit 条。
+    selected_logs = logs[-limit:]
+    anomaly_count = sum(1 for item in selected_logs if item["is_anomaly"])
+    took_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+
+    return {
+        "topic_id": topic_id,
+        "topic": file_topic(path),
+        "start_time": start_time,
+        "end_time": end_time,
+        "query": query,
+        "limit": limit,
+        "source": "local_files",
+        "scan_scope": {
+            "project_root": str(PROJECT_ROOT),
+            "max_file_bytes": MAX_FILE_BYTES,
+            "max_scan_lines_per_file": MAX_SCAN_LINES_PER_FILE,
+            "scanned_lines": scanned_lines,
+        },
+        "total": len(selected_logs),
+        "matched_total_before_limit": len(logs),
+        "anomaly_count": anomaly_count,
+        "severity_counts": severity_counts,
+        "logs": selected_logs,
+        "took_ms": took_ms,
+        "message": f"成功从本地日志文件 {path.name} 查询 {len(selected_logs)} 条日志，异常 {anomaly_count} 条",
+    }
+
+
+@mcp.tool()
+@log_tool_call
+def scan_local_log_anomalies(
+    hours: int = 24,
+    limit_per_file: int = 50,
+    include_normal: bool = False,
+) -> Dict[str, Any]:
+    """自动扫描当前项目本地日志文件，并标注异常日志。
+
+    Args:
+        hours: 扫描最近多少小时的日志，默认 24 小时。
+        limit_per_file: 每个日志文件最多返回多少条，默认 50，最大 200。
+        include_normal: 是否返回普通日志。默认 False，只返回异常/告警日志。
+
+    Returns:
+        Dict: 每个日志文件的异常统计、严重级别统计和命中的日志行。
+    """
+    started_at = datetime.now()
+    hours = max(1, min(int(hours), 24 * 30))
+    limit_per_file = max(1, min(int(limit_per_file), 200))
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(hours=hours)
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    file_results = []
+    global_severity_counts: Dict[str, int] = {}
+    total_anomalies = 0
+    total_returned = 0
+
+    for path in discover_local_log_files():
+        matched_logs = []
+        file_severity_counts: Dict[str, int] = {}
+        scanned_lines = 0
+
+        for line_number, line in read_recent_log_lines(path):
+            scanned_lines += 1
+            log_time = parse_log_timestamp(line)
+            if not in_time_range(log_time, start_ms, end_ms):
+                continue
+
+            is_anomaly, severity, matched_keywords = classify_anomaly(line)
+            if not include_normal and not is_anomaly:
+                continue
+
+            level = detect_log_level(line, severity)
+            file_severity_counts[severity] = file_severity_counts.get(severity, 0) + 1
+            global_severity_counts[severity] = global_severity_counts.get(severity, 0) + 1
+
+            matched_logs.append(
+                {
+                    "timestamp": log_time.strftime("%Y-%m-%d %H:%M:%S") if log_time else None,
+                    "timestamp_ms": int(log_time.timestamp() * 1000) if log_time else None,
+                    "level": level,
+                    "message": line,
+                    "source_file": path.relative_to(PROJECT_ROOT).as_posix(),
+                    "line_number": line_number,
+                    "is_anomaly": is_anomaly,
+                    "severity": severity,
+                    "matched_keywords": matched_keywords,
+                }
+            )
+
+        selected_logs = matched_logs[-limit_per_file:]
+        anomaly_count = sum(1 for item in matched_logs if item["is_anomaly"])
+        total_anomalies += anomaly_count
+        total_returned += len(selected_logs)
+
+        file_results.append(
+            {
+                "topic": file_topic(path),
+                "scanned_lines": scanned_lines,
+                "matched_total_before_limit": len(matched_logs),
+                "returned": len(selected_logs),
+                "anomaly_count": anomaly_count,
+                "severity_counts": file_severity_counts,
+                "logs": selected_logs,
+            }
+        )
+
+    took_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+    return {
+        "success": True,
+        "source": "local_files",
+        "project_root": str(PROJECT_ROOT),
+        "time_range": {
+            "start": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "hours": hours,
+        },
+        "files_scanned": len(file_results),
+        "total_anomalies": total_anomalies,
+        "total_returned": total_returned,
+        "severity_counts": global_severity_counts,
+        "files": file_results,
+        "took_ms": took_ms,
+        "message": f"已扫描 {len(file_results)} 个本地日志文件，发现异常/告警 {total_anomalies} 条",
+    }
 
 
 if __name__ == "__main__":

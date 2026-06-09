@@ -54,9 +54,16 @@ class Settings(BaseSettings):
 
     # 会话记忆压缩配置
     memory_summary_enabled: bool = True
+    memory_summary_strategy: str = "sync"  # sync | async
     memory_summary_dir: str = "memory_summaries"
     memory_summary_max_chars: int = 12000
     memory_summary_keep_recent: int = 8
+
+    # 解决方案沉淀配置
+    solution_capture_enabled: bool = True
+    solution_capture_dir: str = "aiops-docs/solutions"
+    solution_capture_auto_index: bool = True
+    solution_capture_min_chars: int = 500
 
     # MCP 服务配置（transport: stdio | sse | streamable-http）
     # 腾讯云托管 MCP 的 URL 通常含 /sse/，需使用 sse；本地 FastMCP 使用 streamable-http

@@ -12,10 +12,18 @@
 import logging
 import functools
 import json
-import random
+import os
+import platform
+import socket
+import time
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from fastmcp import FastMCP
+
+try:
+    import psutil
+except ImportError:  # 让 MCP 服务仍能启动，并在工具调用时给出明确提示
+    psutil = None
 
 # 配置日志
 logging.basicConfig(
@@ -114,6 +122,43 @@ def generate_time_series(base_time: datetime, minutes_offset: int, format_str: s
     return result_time.strftime(format_str)
 
 
+def bytes_to_gb(value: int | float) -> float:
+    """将字节转换为 GB。"""
+    return round(float(value) / (1024 ** 3), 2)
+
+
+def local_host_info() -> Dict[str, Any]:
+    """返回当前 MCP Server 所在机器的基础信息。"""
+    return {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "system": platform.system(),
+    }
+
+
+def psutil_missing_response(tool_name: str) -> Dict[str, Any]:
+    """psutil 未安装时的统一返回。"""
+    return {
+        "success": False,
+        "metric_source": "local_machine",
+        "tool": tool_name,
+        "error": "psutil is not installed",
+        "message": "本机指标采集依赖 psutil，请先安装依赖：pip install psutil，或重新安装项目依赖。",
+    }
+
+
+def clamp_sample_seconds(sample_seconds: float) -> float:
+    """限制采样时长，避免工具调用被长时间阻塞。"""
+    return max(0.1, min(float(sample_seconds), 5.0))
+
+
+def default_disk_path() -> str:
+    """根据操作系统选择默认磁盘检测路径。"""
+    if os.name == "nt":
+        return os.environ.get("SystemDrive", "C:") + "\\"
+    return "/"
+
 
 
 
@@ -127,13 +172,14 @@ def query_cpu_metrics(
     service_name: str,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
-    interval: str = "1m"
+    interval: str = "1m",
+    sample_seconds: float = 1.0,
 ) -> Dict[str, Any]:
-    """查询服务的 CPU 使用率监控数据。
+    """查询当前 MCP Server 所在机器的实时 CPU 使用率。
 
     Args:
-        service_name: 服务名称（必填）
-            示例: "data-sync-service"
+        service_name: 服务名称（兼容旧参数）。当前实现检测的是本机整体 CPU，
+            service_name 仅作为诊断标签返回，不会按服务过滤。
         
         start_time: 开始时间（可选，字符串类型）
             格式: "YYYY-MM-DD HH:MM:SS"
@@ -147,131 +193,76 @@ def query_cpu_metrics(
             默认值: 如果不传，默认为当前时间
             注意: 必须使用字符串格式，而非时间戳
         
-        interval: 数据聚合间隔（可选）
-            可选值: "1m" (1分钟), "5m" (5分钟), "1h" (1小时)
-            默认值: "1m"
-            说明: 控制数据点的时间间隔
+        interval: 数据聚合间隔（兼容旧参数）。当前本机采集不维护历史时间序列，
+            因此只返回当前快照。
+        sample_seconds: CPU 采样秒数，默认 1 秒，最大 5 秒。
 
     Returns:
         Dict: CPU 监控数据
             - service_name: 服务名称
             - metric_name: 指标名称 (cpu_usage_percent)
-            - interval: 数据聚合间隔
-            - data_points: 数据点列表，每个点包含:
-                * timestamp: 时间点（格式: HH:MM）
-                * value: CPU 使用率百分比
+            - metric_source: local_machine_psutil
+            - data_points: 当前快照数据点
             - statistics: 统计信息
-                * average: 平均值
-                * max: 最大值
-                * min: 最小值
-            - alert: 告警信息（如有）
-                * triggered: 是否触发告警
-                * threshold: 告警阈值
-                * message: 告警消息
-    
-    使用示例:
-        # 示例1: 使用默认时间（最近1小时）
-        query_cpu_metrics(service_name="data-sync-service")
-        
-        # 示例2: 指定时间范围
-        query_cpu_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00",
-            end_time="2026-02-14 11:00:00",
-            interval="5m"
-        )
-        
-        # 示例3: 只指定开始时间（结束时间自动为当前时间）
-        query_cpu_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00"
-        )
+            * current: 当前 CPU 使用率
+            * per_cpu: 每个逻辑核心的使用率
+            * load_average: Linux/macOS 的负载信息，Windows 下为 None
+            - alert_info: 根据当前 CPU 使用率是否超过 80% 给出告警判断
     """
-    # 解析时间参数
-    start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
-    end_dt = parse_time_or_default(end_time, default_offset_hours=0)
-    
-    # 解析间隔时间（interval: 1m, 5m, 1h 等）
-    interval_minutes = 1  # 默认 1 分钟
-    if interval.endswith('m'):
-        interval_minutes = int(interval[:-1])
-    elif interval.endswith('h'):
-        interval_minutes = int(interval[:-1]) * 60
+    if psutil is None:
+        return psutil_missing_response("query_cpu_metrics")
 
-    # 动态生成 CPU 使用率数据：从低到高逐渐增长
-    data_points = []
-    current_time = start_dt
-    time_index = 0
+    now = datetime.now()
+    sample_seconds = clamp_sample_seconds(sample_seconds)
+    cpu_value = round(psutil.cpu_percent(interval=sample_seconds), 1)
+    per_cpu = [round(v, 1) for v in psutil.cpu_percent(interval=None, percpu=True)]
+    cpu_freq = psutil.cpu_freq()
+    load_average = list(os.getloadavg()) if hasattr(os, "getloadavg") else None
+    spike_detected = cpu_value > 80.0
 
-    # 初始 CPU 使用率（10%）
-    base_cpu = 10.0
+    data_point = {
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "value": cpu_value,
+        "hostname": socket.gethostname(),
+    }
 
-    while current_time <= end_dt:
-        # CPU 使用率逐渐升高的算法：
-        # - 前几个数据点保持在 10% 左右
-        # - 然后开始快速上升
-        # - 最终达到 95% 左右
-
-        if time_index < 3:
-            # 初始阶段：10% 左右波动
-            cpu_value = base_cpu + (time_index * 0.5)
-        else:
-            # 上升阶段：使用指数增长模型
-            growth_factor = (time_index - 2) * 8.5
-            cpu_value = min(base_cpu + growth_factor, 96.0)
-
-        # 添加一些随机波动（±2%）
-        cpu_value = round(cpu_value + random.uniform(-2, 2), 1)
-        cpu_value = max(0, min(100, cpu_value))  # 确保在 0-100 范围内
-
-        data_point = {
-            "timestamp": current_time.strftime("%H:%M"),
-            "value": cpu_value,
-            "process_id": "pid-12345"
-        }
-
-        data_points.append(data_point)
-
-        # 下一个时间点
-        current_time += timedelta(minutes=interval_minutes)
-        time_index += 1
-
-    # 计算统计信息
-    if data_points:
-        values = [d["value"] for d in data_points]
-        avg_value = round(sum(values) / len(values), 2)
-        max_value = max(values)
-        min_value = min(values)
-
-        # 检测是否有 CPU 突增（超过 80%）
-        spike_detected = max_value > 80.0
-
-        return {
-            "service_name": service_name,
-            "metric_name": "cpu_usage_percent",
+    return {
+        "success": True,
+        "service_name": service_name,
+        "metric_name": "cpu_usage_percent",
+        "metric_source": "local_machine_psutil",
+        "scope": "local_machine",
+        "host": local_host_info(),
+        "query_range": {
+            "start_time": start_time,
+            "end_time": end_time,
             "interval": interval,
-            "data_points": data_points,
-            "statistics": {
-                "avg": avg_value,
-                "max": max_value,
-                "min": min_value,
-                "p95": round(sorted(values)[int(len(values) * 0.95)] if len(values) > 1 else max_value, 2),
-                "spike_detected": spike_detected
+            "note": "当前实现返回本机实时快照，不维护历史时间序列。",
+        },
+        "data_points": [data_point],
+        "statistics": {
+            "current": cpu_value,
+            "avg": cpu_value,
+            "max": cpu_value,
+            "min": cpu_value,
+            "p95": cpu_value,
+            "per_cpu": per_cpu,
+            "logical_cores": psutil.cpu_count(logical=True),
+            "physical_cores": psutil.cpu_count(logical=False),
+            "frequency_mhz": {
+                "current": round(cpu_freq.current, 2) if cpu_freq else None,
+                "min": round(cpu_freq.min, 2) if cpu_freq else None,
+                "max": round(cpu_freq.max, 2) if cpu_freq else None,
             },
-            "alert_info": {
-                "triggered": spike_detected,
-                "threshold": 80.0,
-                "message": "CPU 使用率持续超过 80% 阈值" if spike_detected else "CPU 使用率正常"
-            }
-        }
-    else:
-        return {
-            "service_name": service_name,
-            "metric_name": "cpu_usage_percent",
-            "interval": interval,
-            "data_points": [],
-            "statistics": {},
-        }
+            "load_average": load_average,
+            "spike_detected": spike_detected,
+        },
+        "alert_info": {
+            "triggered": spike_detected,
+            "threshold": 80.0,
+            "message": "本机 CPU 使用率超过 80% 阈值" if spike_detected else "本机 CPU 使用率正常",
+        },
+    }
 
 
 @mcp.tool()
@@ -282,11 +273,11 @@ def query_memory_metrics(
     end_time: Optional[str] = None,
     interval: str = "1m"
 ) -> Dict[str, Any]:
-    """查询服务的内存使用监控数据。
+    """查询当前 MCP Server 所在机器的实时内存使用情况。
 
     Args:
-        service_name: 服务名称（必填）
-            示例: "data-sync-service"
+        service_name: 服务名称（兼容旧参数）。当前实现检测的是本机整体内存，
+            service_name 仅作为诊断标签返回，不会按服务过滤。
         
         start_time: 开始时间（可选，字符串类型）
             格式: "YYYY-MM-DD HH:MM:SS"
@@ -300,132 +291,243 @@ def query_memory_metrics(
             默认值: 如果不传，默认为当前时间
             注意: 必须使用字符串格式，而非时间戳
         
-        interval: 数据聚合间隔（可选）
-            可选值: "1m" (1分钟), "5m" (5分钟), "1h" (1小时)
-            默认值: "1m"
+        interval: 数据聚合间隔（兼容旧参数）。当前本机采集不维护历史时间序列，
+            因此只返回当前快照。
 
     Returns:
         Dict: 内存监控数据
             - service_name: 服务名称
             - metric_name: 指标名称 (memory_usage_percent)
-            - interval: 数据聚合间隔
-            - data_points: 数据点列表，每个点包含:
-                * timestamp: 时间点（格式: HH:MM）
-                * value: 内存使用率百分比
-                * used_gb: 已使用内存（GB）
-                * total_gb: 总内存（GB）
+            - metric_source: local_machine_psutil
+            - data_points: 当前快照数据点
             - statistics: 统计信息
-                * average: 平均值
-                * max: 最大值
-                * min: 最小值
-            - alert: 告警信息（如有）
-                * triggered: 是否触发告警
-                * threshold: 告警阈值
-                * message: 告警消息
-    
-    使用示例:
-        # 示例1: 使用默认时间（最近1小时）
-        query_memory_metrics(service_name="data-sync-service")
-        
-        # 示例2: 指定时间范围
-        query_memory_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00",
-            end_time="2026-02-14 11:00:00",
-            interval="5m"
-        )
+            * current: 当前内存使用率
+            * total_gb / used_gb / available_gb: 内存容量
+            * swap: 交换分区使用情况
+            - alert_info: 根据当前内存使用率是否超过 70% 给出告警判断
     """
-    # 解析时间参数
-    start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
-    end_dt = parse_time_or_default(end_time, default_offset_hours=0)
-    
-    # 解析间隔时间（interval: 1m, 5m, 1h 等）
-    interval_minutes = 1  # 默认 1 分钟
-    if interval.endswith('m'):
-        interval_minutes = int(interval[:-1])
-    elif interval.endswith('h'):
-        interval_minutes = int(interval[:-1]) * 60
-    
-    # 动态生成内存使用率数据：从低到高逐渐增长
-    data_points = []
-    current_time = start_dt
-    time_index = 0
-    
-    # 初始内存使用率（30%）
-    base_memory = 30.0
-    total_gb = 8.0  # 总内存 8GB
-    
-    while current_time <= end_dt:
-        # 内存使用率逐渐升高的算法：
-        # - 前几个数据点保持在 30% 左右
-        # - 然后开始逐步上升
-        # - 最终达到 85% 左右
-        
-        if time_index < 3:
-            # 初始阶段：30% 左右波动
-            memory_value = base_memory + (time_index * 1.0)
-        else:
-            # 上升阶段：使用线性增长模型（内存增长比 CPU 慢）
-            growth_factor = (time_index - 2) * 5.5
-            memory_value = min(base_memory + growth_factor, 85.0)
-        
-        # 添加一些随机波动（±1%）
-        memory_value = round(memory_value + random.uniform(-1, 1), 1)
-        memory_value = max(0, min(100, memory_value))  # 确保在 0-100 范围内
-        
-        # 计算已使用内存（GB）
-        used_gb = round((memory_value / 100.0) * total_gb, 2)
-        
-        data_point = {
-            "timestamp": current_time.strftime("%H:%M"),
-            "value": memory_value,
-            "used_gb": used_gb,
-            "total_gb": total_gb
-        }
-        
-        data_points.append(data_point)
-        
-        # 下一个时间点
-        current_time += timedelta(minutes=interval_minutes)
-        time_index += 1
-    
-    # 计算统计信息
-    if data_points:
-        values = [d["value"] for d in data_points]
-        avg_value = round(sum(values) / len(values), 2)
-        max_value = max(values)
-        min_value = min(values)
-        
-        # 检测是否有内存压力（超过 70%）
-        memory_pressure = max_value > 70.0
-        
-        return {
-            "service_name": service_name,
-            "metric_name": "memory_usage_percent",
+    if psutil is None:
+        return psutil_missing_response("query_memory_metrics")
+
+    now = datetime.now()
+    memory = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    memory_value = round(memory.percent, 1)
+    memory_pressure = memory_value > 70.0
+
+    data_point = {
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "value": memory_value,
+        "used_gb": bytes_to_gb(memory.used),
+        "available_gb": bytes_to_gb(memory.available),
+        "total_gb": bytes_to_gb(memory.total),
+        "hostname": socket.gethostname(),
+    }
+
+    return {
+        "success": True,
+        "service_name": service_name,
+        "metric_name": "memory_usage_percent",
+        "metric_source": "local_machine_psutil",
+        "scope": "local_machine",
+        "host": local_host_info(),
+        "query_range": {
+            "start_time": start_time,
+            "end_time": end_time,
             "interval": interval,
-            "data_points": data_points,
-            "statistics": {
-                "avg": avg_value,
-                "max": max_value,
-                "min": min_value,
-                "p95": round(sorted(values)[int(len(values) * 0.95)] if len(values) > 1 else max_value, 2),
-                "memory_pressure": memory_pressure
+            "note": "当前实现返回本机实时快照，不维护历史时间序列。",
+        },
+        "data_points": [data_point],
+        "statistics": {
+            "current": memory_value,
+            "avg": memory_value,
+            "max": memory_value,
+            "min": memory_value,
+            "p95": memory_value,
+            "total_gb": bytes_to_gb(memory.total),
+            "used_gb": bytes_to_gb(memory.used),
+            "available_gb": bytes_to_gb(memory.available),
+            "free_gb": bytes_to_gb(memory.free),
+            "swap": {
+                "total_gb": bytes_to_gb(swap.total),
+                "used_gb": bytes_to_gb(swap.used),
+                "free_gb": bytes_to_gb(swap.free),
+                "percent": round(swap.percent, 1),
             },
-            "alert_info": {
-                "triggered": memory_pressure,
-                "threshold": 70.0,
-                "message": "内存使用率超过 70% 阈值，存在内存压力" if memory_pressure else "内存使用率正常"
-            }
-        }
-    else:
+            "memory_pressure": memory_pressure,
+        },
+        "alert_info": {
+            "triggered": memory_pressure,
+            "threshold": 70.0,
+            "message": "本机内存使用率超过 70% 阈值，存在内存压力" if memory_pressure else "本机内存使用率正常",
+        },
+    }
+
+
+@mcp.tool()
+@log_tool_call
+def query_disk_metrics(path: Optional[str] = None) -> Dict[str, Any]:
+    """查询当前 MCP Server 所在机器的磁盘使用情况。
+
+    Args:
+        path: 要检查的挂载点或磁盘路径。Windows 默认 C:\\，Linux/macOS 默认 /。
+
+    Returns:
+        Dict: 磁盘使用率、容量、分区列表和告警判断。
+    """
+    if psutil is None:
+        return psutil_missing_response("query_disk_metrics")
+
+    target_path = path or default_disk_path()
+    try:
+        usage = psutil.disk_usage(target_path)
+    except Exception as e:
         return {
-            "service_name": service_name,
-            "metric_name": "memory_usage_percent",
-            "interval": interval,
-            "data_points": [],
-            "statistics": {},
-            "error": "时间范围无效或没有生成数据点"
+            "success": False,
+            "metric_source": "local_machine_psutil",
+            "scope": "local_machine",
+            "host": local_host_info(),
+            "path": target_path,
+            "error": str(e),
+            "message": f"磁盘路径不可用: {target_path}",
         }
+
+    partitions = []
+    for part in psutil.disk_partitions(all=False):
+        try:
+            part_usage = psutil.disk_usage(part.mountpoint)
+        except Exception:
+            continue
+        partitions.append(
+            {
+                "device": part.device,
+                "mountpoint": part.mountpoint,
+                "fstype": part.fstype,
+                "total_gb": bytes_to_gb(part_usage.total),
+                "used_gb": bytes_to_gb(part_usage.used),
+                "free_gb": bytes_to_gb(part_usage.free),
+                "percent": round(part_usage.percent, 1),
+            }
+        )
+
+    disk_pressure = usage.percent > 85.0
+    return {
+        "success": True,
+        "metric_name": "disk_usage_percent",
+        "metric_source": "local_machine_psutil",
+        "scope": "local_machine",
+        "host": local_host_info(),
+        "path": target_path,
+        "statistics": {
+            "total_gb": bytes_to_gb(usage.total),
+            "used_gb": bytes_to_gb(usage.used),
+            "free_gb": bytes_to_gb(usage.free),
+            "percent": round(usage.percent, 1),
+        },
+        "partitions": partitions,
+        "alert_info": {
+            "triggered": disk_pressure,
+            "threshold": 85.0,
+            "message": "本机磁盘使用率超过 85% 阈值" if disk_pressure else "本机磁盘使用率正常",
+        },
+    }
+
+
+@mcp.tool()
+@log_tool_call
+def query_process_list(limit: int = 10, sort_by: str = "memory") -> Dict[str, Any]:
+    """查询当前 MCP Server 所在机器上 CPU 或内存占用最高的进程。
+
+    Args:
+        limit: 返回进程数量，默认 10，最大 50。
+        sort_by: 排序方式，支持 memory 或 cpu。
+
+    Returns:
+        Dict: 进程列表，包含 pid、名称、用户、CPU%、内存%、RSS 内存等。
+    """
+    if psutil is None:
+        return psutil_missing_response("query_process_list")
+
+    limit = max(1, min(int(limit), 50))
+    sort_by = sort_by.lower()
+    if sort_by not in ("memory", "cpu"):
+        sort_by = "memory"
+
+    processes = []
+    raw_processes = list(psutil.process_iter(["pid", "name", "username", "status", "create_time"]))
+
+    for proc in raw_processes:
+        try:
+            proc.cpu_percent(interval=None)
+        except Exception:
+            continue
+
+    time.sleep(0.2)
+
+    for proc in raw_processes:
+        try:
+            info = proc.info
+            memory_info = proc.memory_info()
+            create_time = datetime.fromtimestamp(info.get("create_time", 0)).strftime("%Y-%m-%d %H:%M:%S")
+            processes.append(
+                {
+                    "pid": info.get("pid"),
+                    "name": info.get("name"),
+                    "username": info.get("username"),
+                    "status": info.get("status"),
+                    "cpu_percent": round(proc.cpu_percent(interval=None), 1),
+                    "memory_percent": round(proc.memory_percent(), 2),
+                    "rss_gb": bytes_to_gb(memory_info.rss),
+                    "create_time": create_time,
+                }
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    sort_key = "cpu_percent" if sort_by == "cpu" else "memory_percent"
+    processes.sort(key=lambda item: item.get(sort_key, 0), reverse=True)
+
+    return {
+        "success": True,
+        "metric_source": "local_machine_psutil",
+        "scope": "local_machine",
+        "host": local_host_info(),
+        "sort_by": sort_by,
+        "total_seen": len(processes),
+        "processes": processes[:limit],
+        "message": f"已获取本机 {len(processes[:limit])} 个进程，按 {sort_by} 占用排序",
+    }
+
+
+@mcp.tool()
+@log_tool_call
+def get_local_system_info() -> Dict[str, Any]:
+    """查询当前 MCP Server 所在机器的基础系统信息。"""
+    if psutil is None:
+        return psutil_missing_response("get_local_system_info")
+
+    boot_time = datetime.fromtimestamp(psutil.boot_time())
+    uptime = datetime.now() - boot_time
+    memory = psutil.virtual_memory()
+
+    return {
+        "success": True,
+        "metric_source": "local_machine_psutil",
+        "scope": "local_machine",
+        "host": local_host_info(),
+        "boot_time": boot_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "uptime_seconds": int(uptime.total_seconds()),
+        "cpu": {
+            "logical_cores": psutil.cpu_count(logical=True),
+            "physical_cores": psutil.cpu_count(logical=False),
+        },
+        "memory": {
+            "total_gb": bytes_to_gb(memory.total),
+            "available_gb": bytes_to_gb(memory.available),
+            "percent": round(memory.percent, 1),
+        },
+        "disk_default_path": default_disk_path(),
+    }
 
 
 
