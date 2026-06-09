@@ -27,6 +27,7 @@ from app.agent.mcp_client import (
     format_exception_chain,
     suggest_mcp_transport,
 )
+from app.services.memory_summary_service import memory_summary_service
 
 # 阿里千问大模型和langchain集成参考： https://docs.langchain.com/oss/python/integrations/chat/qwen
 # 注意：需要配置环境变量 DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1 否则默认访问的是新加坡站点
@@ -154,6 +155,15 @@ class RagAgentService:
             tool_names = [tool.name if hasattr(tool, "name") else str(tool) for tool in all_tools]
             logger.info(f"可用工具列表: {', '.join(tool_names)}")
 
+    async def _maybe_compress_session_memory(self, session_id: str) -> None:
+        """在对话前按需压缩当前 session 的历史记忆."""
+        compressed = await memory_summary_service.maybe_compress_agent_state(
+            agent=self.agent,
+            session_id=session_id,
+        )
+        if compressed:
+            logger.info(f"[会话 {session_id}] 已完成历史记忆压缩")
+
     def _build_system_prompt(self) -> str:
         """
         构建系统提示词
@@ -201,6 +211,7 @@ class RagAgentService:
         """
         try:
             await self._initialize_agent()
+            await self._maybe_compress_session_memory(session_id)
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（非流式）: {question}")
 
@@ -270,6 +281,7 @@ class RagAgentService:
         """
         try:
             await self._initialize_agent()
+            await self._maybe_compress_session_memory(session_id)
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（流式）: {question}")
 
@@ -400,6 +412,7 @@ class RagAgentService:
         try:
             # 使用 checkpointer 的 delete_thread 方法删除该 thread 的所有检查点
             self.checkpointer.delete_thread(session_id)
+            memory_summary_service.delete_summary(session_id)
             
             logger.info(f"已清除会话历史: {session_id}")
             return True

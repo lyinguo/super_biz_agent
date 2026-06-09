@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     chunk_max_size: int = 800
     chunk_overlap: int = 100
 
+    # 会话记忆压缩配置
+    memory_summary_enabled: bool = True
+    memory_summary_dir: str = "memory_summaries"
+    memory_summary_max_chars: int = 12000
+    memory_summary_keep_recent: int = 8
+
     # MCP 服务配置（transport: stdio | sse | streamable-http）
     # 腾讯云托管 MCP 的 URL 通常含 /sse/，需使用 sse；本地 FastMCP 使用 streamable-http
     mcp_cls_transport: str = "streamable-http"

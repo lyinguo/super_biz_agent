@@ -9,6 +9,7 @@ UPLOAD_API = $(SERVER_URL)/api/upload
 HEALTH_CHECK_API = $(SERVER_URL)/health
 DOCS_DIR = aiops-docs
 MILVUS_CONTAINER = milvus-standalone
+CURL = curl --connect-timeout 2 --max-time 5
 
 # 颜色输出
 GREEN = \033[0;32m
@@ -265,7 +266,7 @@ status-mcp:
 		echo "  状态: $(GREEN)运行中$(NC)"; \
 		echo "  PID: $$pid"; \
 		echo "  URL: http://127.0.0.1:8003/mcp"; \
-		curl -s http://127.0.0.1:8003/mcp > /dev/null 2>&1 && \
+		$(CURL) -s http://127.0.0.1:8003/mcp > /dev/null 2>&1 && \
 			echo "  连接: $(GREEN)✅ 正常$(NC)" || \
 			echo "  连接: $(RED)❌ 无法连接$(NC)"; \
 	else \
@@ -278,7 +279,7 @@ status-mcp:
 		echo "  状态: $(GREEN)运行中$(NC)"; \
 		echo "  PID: $$pid"; \
 		echo "  URL: http://127.0.0.1:8004/mcp"; \
-		curl -s http://127.0.0.1:8004/mcp > /dev/null 2>&1 && \
+		$(CURL) -s http://127.0.0.1:8004/mcp > /dev/null 2>&1 && \
 			echo "  连接: $(GREEN)✅ 正常$(NC)" || \
 			echo "  连接: $(RED)❌ 无法连接$(NC)"; \
 	else \
@@ -313,11 +314,11 @@ start:
 # 启动 FastAPI 服务
 start-api:
 	@echo "$(YELLOW)🚀 启动 FastAPI 服务...$(NC)"
-	@if curl -s -f $(HEALTH_CHECK_API) > /dev/null 2>&1; then \
+	@if $(CURL) -s -f $(HEALTH_CHECK_API) > /dev/null 2>&1; then \
 		echo "$(GREEN)✅ FastAPI 服务已经在运行中 ($(SERVER_URL))$(NC)"; \
 	else \
 		echo "$(YELLOW)📦 正在启动 FastAPI 服务（后台运行）...$(NC)"; \
-		nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 9900 > server.log 2>&1 & \
+		nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 9900 > server.log 2>&1 & \
 		echo $$! > server.pid; \
 		echo "$(GREEN)✅ FastAPI 服务启动命令已执行$(NC)"; \
 		echo "$(YELLOW)   PID: $$(cat server.pid)$(NC)"; \
@@ -413,7 +414,7 @@ wait:
 	@max_attempts=60; \
 	attempt=0; \
 	while [ $$attempt -lt $$max_attempts ]; do \
-		if curl -s -f $(HEALTH_CHECK_API) > /dev/null 2>&1; then \
+		if $(CURL) -s -f $(HEALTH_CHECK_API) > /dev/null 2>&1; then \
 			echo ""; \
 			echo "$(GREEN)✅ 服务器已就绪！($(SERVER_URL))$(NC)"; \
 			exit 0; \
@@ -430,11 +431,11 @@ wait:
 # 检查服务状态
 check:
 	@echo "$(YELLOW)🔍 检查服务器状态...$(NC)"
-	@if curl -s -f $(HEALTH_CHECK_API) > /dev/null 2>&1; then \
+	@if $(CURL) -s -f $(HEALTH_CHECK_API) > /dev/null 2>&1; then \
 		echo "$(GREEN)✅ 服务器运行正常 ($(SERVER_URL))$(NC)"; \
 		echo ""; \
 		echo "$(CYAN)健康检查响应:$(NC)"; \
-		curl -s $(HEALTH_CHECK_API) | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin), indent=2, ensure_ascii=False))" 2>/dev/null || curl -s $(HEALTH_CHECK_API); \
+		$(CURL) -s $(HEALTH_CHECK_API) | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin), indent=2, ensure_ascii=False))" 2>/dev/null || $(CURL) -s $(HEALTH_CHECK_API); \
 	else \
 		echo "$(RED)❌ 服务器未运行或无法连接！$(NC)"; \
 		echo "$(YELLOW)请先启动服务: make start$(NC)"; \
@@ -470,7 +471,7 @@ upload:
 			count=$$((count + 1)); \
 			filename=$$(basename "$$file"); \
 			echo "$(YELLOW)  [$$count] 上传文件: $$filename$(NC)"; \
-			response=$$(curl -s -w "\n%{http_code}" -X POST $(UPLOAD_API) \
+			response=$$($(CURL) -s -w "\n%{http_code}" -X POST $(UPLOAD_API) \
 				-F "file=@$$file" \
 				-H "Accept: application/json"); \
 			http_code=$$(echo "$$response" | tail -n1); \
@@ -509,10 +510,10 @@ test-upload:
 	@first_file=$$(ls $(DOCS_DIR)/*.md 2>/dev/null | head -n1); \
 	if [ -n "$$first_file" ]; then \
 		echo "$(YELLOW)上传文件: $$first_file$(NC)"; \
-		curl -X POST $(UPLOAD_API) \
+		$(CURL) -X POST $(UPLOAD_API) \
 			-F "file=@$$first_file" \
 			-H "Accept: application/json" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin), indent=2, ensure_ascii=False))" 2>/dev/null || \
-			curl -X POST $(UPLOAD_API) -F "file=@$$first_file"; \
+			$(CURL) -X POST $(UPLOAD_API) -F "file=@$$first_file"; \
 	else \
 		echo "$(RED)测试文件不存在$(NC)"; \
 	fi

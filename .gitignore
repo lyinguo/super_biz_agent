@@ -61,6 +61,9 @@ volumes/
 uploads/
 *.tmp
 
+# Generated memory summaries
+memory_summaries/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -77,4 +80,3 @@ dmypy.json
 
 # Ruff
 .ruff_cache/
-
