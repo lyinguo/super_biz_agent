@@ -9,6 +9,8 @@ UPLOAD_API = $(SERVER_URL)/api/upload
 HEALTH_CHECK_API = $(SERVER_URL)/health
 DOCS_DIR = aiops-docs
 MILVUS_CONTAINER = milvus-standalone
+PROMETHEUS_CONTAINER = super-biz-prometheus
+PROMETHEUS_URL = http://localhost:9090
 CURL = curl --connect-timeout 2 --max-time 5
 
 # 颜色输出
@@ -22,7 +24,8 @@ NC = \033[0m
         install install-dev dev run test test-quick format lint fix type-check \
         security pre-commit-install pre-commit check-all coverage docs shell \
         ipython watch add add-dev remove list-docs test-upload sync logs \
-        start-cls stop-cls start-monitor stop-monitor start-api stop-api status-mcp
+        start-cls stop-cls start-monitor stop-monitor start-api stop-api status-mcp \
+        prometheus-up prometheus-down prometheus-status prometheus-check
 
 # ============================================================
 # 默认目标：显示帮助信息
@@ -39,6 +42,9 @@ help:
 	@echo "  $(YELLOW)make up$(NC)           - 🐳 启动 Milvus 容器"
 	@echo "  $(YELLOW)make down$(NC)         - 🛑 停止 Milvus 容器"
 	@echo "  $(YELLOW)make status$(NC)       - 📊 查看容器状态"
+	@echo "  $(YELLOW)make prometheus-up$(NC) - 📈 启动 Prometheus 告警服务"
+	@echo "  $(YELLOW)make prometheus-down$(NC) - 🛑 停止 Prometheus 告警服务"
+	@echo "  $(YELLOW)make prometheus-status$(NC) - 📊 查看 Prometheus 状态"
 	@echo ""
 	@echo "$(CYAN)【服务管理】$(NC)"
 	@echo "  $(YELLOW)make start$(NC)        - 🚀 启动所有服务（MCP + FastAPI）"
@@ -99,16 +105,19 @@ init:
 	@echo "$(GREEN)🚀 开始一键初始化 SuperBizAgent...$(NC)"
 	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
 	@echo ""
-	@echo "$(YELLOW)步骤 1/4: 启动 Docker 容器（Milvus 向量数据库）$(NC)"
+	@echo "$(YELLOW)步骤 1/5: 启动 Docker 容器（Milvus 向量数据库）$(NC)"
 	@$(MAKE) up
 	@echo ""
-	@echo "$(YELLOW)步骤 2/4: 启动 FastAPI 服务$(NC)"
+	@echo "$(YELLOW)步骤 2/5: 启动 Prometheus 告警服务$(NC)"
+	@$(MAKE) prometheus-up
+	@echo ""
+	@echo "$(YELLOW)步骤 3/5: 启动 FastAPI 服务$(NC)"
 	@$(MAKE) start
 	@echo ""
-	@echo "$(YELLOW)步骤 3/4: 等待服务就绪$(NC)"
+	@echo "$(YELLOW)步骤 4/5: 等待服务就绪$(NC)"
 	@$(MAKE) wait
 	@echo ""
-	@echo "$(YELLOW)步骤 4/4: 上传文档到向量数据库$(NC)"
+	@echo "$(YELLOW)步骤 5/5: 上传文档到向量数据库$(NC)"
 	@$(MAKE) upload
 	@echo ""
 	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
@@ -118,6 +127,7 @@ init:
 	@echo "$(GREEN)🌐 服务访问地址:$(NC)"
 	@echo "   API 服务: $(SERVER_URL)"
 	@echo "   API 文档: $(SERVER_URL)/docs"
+	@echo "   Prometheus: $(PROMETHEUS_URL)"
 	@echo "   Attu (Milvus Web UI): http://localhost:8000"
 	@echo "   MinIO: http://localhost:9001 (admin/minioadmin)"
 	@echo ""
@@ -164,27 +174,71 @@ up:
 # 停止 Docker 容器
 down:
 	@echo "$(YELLOW)🛑 停止 Docker 容器...$(NC)"
-	@if docker ps --format '{{.Names}}' | grep -q "milvus"; then \
+	@if docker ps --format '{{.Names}}' | grep -E -q "milvus|$(PROMETHEUS_CONTAINER)"; then \
 		docker compose -f vector-database.yml down; \
 		echo "$(GREEN)✅ Docker 容器已停止$(NC)"; \
 	else \
-		echo "$(YELLOW)⚠️  没有运行中的 Milvus 容器$(NC)"; \
+		echo "$(YELLOW)⚠️  没有运行中的 Milvus/Prometheus 容器$(NC)"; \
 	fi
 
 # 查看容器状态
 status:
 	@echo "$(YELLOW)📊 Docker 容器状态:$(NC)"
 	@echo ""
-	@if docker ps -a --format '{{.Names}}' | grep -q "milvus"; then \
-		docker ps -a --filter "name=milvus" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"; \
+	@if docker ps -a --format '{{.Names}}' | grep -E -q "milvus|$(PROMETHEUS_CONTAINER)"; then \
+		docker ps -a --filter "name=milvus" --filter "name=$(PROMETHEUS_CONTAINER)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"; \
 		echo ""; \
-		running=$$(docker ps --filter "name=milvus" --format '{{.Names}}' | wc -l | tr -d ' '); \
-		total=$$(docker ps -a --filter "name=milvus" --format '{{.Names}}' | wc -l | tr -d ' '); \
+		running=$$(docker ps --filter "name=milvus" --filter "name=$(PROMETHEUS_CONTAINER)" --format '{{.Names}}' | wc -l | tr -d ' '); \
+		total=$$(docker ps -a --filter "name=milvus" --filter "name=$(PROMETHEUS_CONTAINER)" --format '{{.Names}}' | wc -l | tr -d ' '); \
 		echo "$(GREEN)运行中: $$running / $$total$(NC)"; \
 	else \
-		echo "$(YELLOW)⚠️  没有找到 Milvus 相关容器$(NC)"; \
-		echo "$(YELLOW)提示: 请先创建 Milvus 容器$(NC)"; \
+		echo "$(YELLOW)⚠️  没有找到 Milvus/Prometheus 相关容器$(NC)"; \
+		echo "$(YELLOW)提示: 请先执行 make up 或 make prometheus-up$(NC)"; \
 	fi
+
+# 启动 Prometheus 告警服务
+prometheus-up:
+	@echo "$(YELLOW)📈 启动 Prometheus 告警服务...$(NC)"
+	@if ! docker info > /dev/null 2>&1; then \
+		echo "$(RED)❌ Docker 未运行，请先启动 Docker$(NC)"; \
+		exit 1; \
+	fi
+	@if docker ps --format '{{.Names}}' | grep -q "^$(PROMETHEUS_CONTAINER)$$"; then \
+		echo "$(GREEN)✅ Prometheus 已经在运行中 ($(PROMETHEUS_URL))$(NC)"; \
+	else \
+		docker compose -f vector-database.yml up -d prometheus; \
+		echo "$(YELLOW)⏳ 等待 Prometheus 启动...$(NC)"; \
+		sleep 3; \
+		$(MAKE) prometheus-status; \
+	fi
+
+# 停止 Prometheus 告警服务
+prometheus-down:
+	@echo "$(YELLOW)🛑 停止 Prometheus 告警服务...$(NC)"
+	@if docker ps -a --format '{{.Names}}' | grep -q "^$(PROMETHEUS_CONTAINER)$$"; then \
+		docker compose -f vector-database.yml stop prometheus; \
+		echo "$(GREEN)✅ Prometheus 已停止$(NC)"; \
+	else \
+		echo "$(YELLOW)⚠️  未找到 Prometheus 容器$(NC)"; \
+	fi
+
+# 查看 Prometheus 状态
+prometheus-status:
+	@echo "$(YELLOW)📊 Prometheus 状态:$(NC)"
+	@if docker ps -a --format '{{.Names}}' | grep -q "^$(PROMETHEUS_CONTAINER)$$"; then \
+		docker ps -a --filter "name=$(PROMETHEUS_CONTAINER)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"; \
+	else \
+		echo "$(YELLOW)⚠️  未找到 Prometheus 容器$(NC)"; \
+	fi
+	@$(CURL) -s -f $(PROMETHEUS_URL)/-/healthy > /dev/null 2>&1 && \
+		echo "$(GREEN)✅ Prometheus 健康检查正常: $(PROMETHEUS_URL)$(NC)" || \
+		echo "$(RED)❌ Prometheus 暂不可访问: $(PROMETHEUS_URL)$(NC)"
+
+# 检查 Prometheus 告警 API
+prometheus-check:
+	@echo "$(YELLOW)🔍 检查 Prometheus 告警 API...$(NC)"
+	@$(CURL) -s -f $(PROMETHEUS_URL)/api/v1/alerts | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin), indent=2, ensure_ascii=False))" 2>/dev/null || \
+		(echo "$(RED)❌ Prometheus 告警 API 不可访问$(NC)"; exit 1)
 
 # ============================================================
 # MCP 服务管理

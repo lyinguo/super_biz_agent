@@ -1,0 +1,12 @@
+groups:
+  - name: super_biz_agent_base
+    rules:
+      - alert: PrometheusSelfScrapeDown
+        expr: up{job="prometheus"} == 0
+        for: 1m
+        labels:
+          severity: warning
+          service: prometheus
+        annotations:
+          summary: Prometheus self scrape is down
+          description: Prometheus cannot scrape its own metrics for more than 1 minute.

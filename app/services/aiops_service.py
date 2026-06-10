@@ -243,7 +243,10 @@ class AIOpsService:
                 **重要提醒**：
                 - 最终输出必须是纯 Markdown 文本，不要包含 JSON 结构
                 - 所有内容必须基于工具查询的真实数据，严禁编造
-                - 如果某个步骤失败，在结论中如实说明，不要跳过""")
+                - 如果某个步骤失败，在结论中如实说明，不要跳过
+                - 如果 Prometheus 告警查询失败或不可用，不要立即结束诊断；请继续使用本机监控和日志工具进行兜底检查：
+                  query_cpu_metrics、query_memory_metrics、query_disk_metrics、query_process_list、scan_local_log_anomalies
+                - 最终报告需要同时说明「Prometheus 告警系统状态」和「本机现场检查结果」""")
 
         async for event in self.execute(aiops_task, session_id):
             # 转换事件格式以兼容旧的 API

@@ -23,6 +23,20 @@ ALERTS_API_PATH = "/api/v1/alerts"
 # 常见 label：在简化输出中带出，便于扫一眼定位服务/实例/级别（不存在则省略）
 COMMON_LABEL_KEYS = ("alertname", "severity", "instance", "job", "namespace", "pod")
 
+FALLBACK_TOOLS = (
+    "query_cpu_metrics",
+    "query_memory_metrics",
+    "query_disk_metrics",
+    "query_process_list",
+    "scan_local_log_anomalies",
+)
+
+
+def prometheus_alerts_url() -> str:
+    """返回当前配置下的 Prometheus alerts API 地址。"""
+    base_url = config.prometheus_base_url.rstrip("/")
+    return f"{base_url}{ALERTS_API_PATH}"
+
 
 def _parse_active_at(active_at_str: str) -> datetime | None:
     """将 Prometheus 返回的 activeAt（RFC3339 或带 Z 后缀）解析为 UTC 时间。"""
@@ -66,8 +80,7 @@ def query_prometheus_alerts_api() -> tuple[dict[str, Any], str | None]:
 
     返回 (JSON 体, 错误信息)。成功时第二项为 None；HTTP 或 JSON 解析失败时第一项为空 dict。
     """
-    base_url = config.prometheus_base_url.rstrip("/")
-    api_url = f"{base_url}{ALERTS_API_PATH}"
+    api_url = prometheus_alerts_url()
     logger.info("Querying Prometheus alerts: {}", api_url)
     try:
         with httpx.Client(timeout=config.prometheus_request_timeout) as client:
@@ -79,6 +92,30 @@ def query_prometheus_alerts_api() -> tuple[dict[str, Any], str | None]:
     except json.JSONDecodeError as e:
         return {}, f"failed to parse response: {e}"
     return body, None
+
+
+def build_prometheus_failure_response(error: str) -> dict[str, Any]:
+    """构建 Agent 友好的 Prometheus 失败结果，提示继续用本机工具兜底。"""
+    return {
+        "success": False,
+        "prometheus_available": False,
+        "checked_url": prometheus_alerts_url(),
+        "error": error,
+        "message": "Prometheus 告警查询失败，无法从 Prometheus 获取当前活跃告警。",
+        "fallback_required": True,
+        "fallback_reason": (
+            "Prometheus 不可用不代表系统没有异常。请继续调用本机监控和日志 MCP 工具，"
+            "检查当前机器 CPU、内存、磁盘、进程和本地日志异常。"
+        ),
+        "recommended_fallback_tools": list(FALLBACK_TOOLS),
+        "next_actions": [
+            "调用 query_cpu_metrics 检查本机 CPU 使用率",
+            "调用 query_memory_metrics 检查本机内存使用率",
+            "调用 query_disk_metrics 检查本机磁盘使用率",
+            "调用 query_process_list 检查高占用进程",
+            "调用 scan_local_log_anomalies 扫描本项目日志异常",
+        ],
+    }
 
 
 def _pick_common_labels(labels: dict[str, Any]) -> dict[str, Any]:
@@ -172,27 +209,32 @@ def query_prometheus_alerts() -> str:
     Returns:
         str: JSON 字符串。成功时含告警列表与状态统计；失败时含 success=false 与 error。
     """
-    result, err = query_prometheus_alerts_api()
-    if err:
+    if not config.prometheus_enabled:
         out = {
             "success": False,
-            "error": err,
-            "message": "Failed to query Prometheus alerts",
+            "prometheus_available": False,
+            "checked_url": prometheus_alerts_url(),
+            "message": "Prometheus 告警查询已通过配置关闭。",
+            "fallback_required": True,
+            "recommended_fallback_tools": list(FALLBACK_TOOLS),
         }
+        return json.dumps(out, ensure_ascii=False, indent=2)
+
+    result, err = query_prometheus_alerts_api()
+    if err:
+        out = build_prometheus_failure_response(err)
         return json.dumps(out, ensure_ascii=False, indent=2)
 
     if result.get("status") != "success":
         err_msg = result.get("error") or result.get("errorType") or "Prometheus returned non-success status"
-        out = {
-            "success": False,
-            "error": str(err_msg),
-            "message": "Failed to query Prometheus alerts",
-        }
+        out = build_prometheus_failure_response(str(err_msg))
         return json.dumps(out, ensure_ascii=False, indent=2)
 
     simplified, state_counts = _simplify_alerts(result)
     out = {
         "success": True,
+        "prometheus_available": True,
+        "checked_url": prometheus_alerts_url(),
         "alerts": simplified,
         "state_counts": state_counts,
         "total": len(simplified),
