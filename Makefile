@@ -12,6 +12,7 @@ MILVUS_CONTAINER = milvus-standalone
 PROMETHEUS_CONTAINER = super-biz-prometheus
 PROMETHEUS_URL = http://localhost:9090
 CURL = curl --connect-timeout 2 --max-time 5
+UPLOAD_CURL = curl --connect-timeout 5 --max-time 300
 
 # 颜色输出
 GREEN = \033[0;32m
@@ -25,7 +26,7 @@ NC = \033[0m
         security pre-commit-install pre-commit check-all coverage docs shell \
         ipython watch add add-dev remove list-docs test-upload sync logs \
         start-cls stop-cls start-monitor stop-monitor start-api stop-api status-mcp \
-        prometheus-up prometheus-down prometheus-status prometheus-check
+        prometheus-up prometheus-down prometheus-status prometheus-check prometheus-up-checked
 
 # ============================================================
 # 默认目标：显示帮助信息
@@ -109,10 +110,10 @@ init:
 	@$(MAKE) up
 	@echo ""
 	@echo "$(YELLOW)步骤 2/5: 启动 Prometheus 告警服务$(NC)"
-	@$(MAKE) prometheus-up
+	@$(MAKE) prometheus-up-checked
 	@echo ""
-	@echo "$(YELLOW)步骤 3/5: 启动 FastAPI 服务$(NC)"
-	@$(MAKE) start
+	@echo "$(YELLOW)步骤 3/5: 重启 MCP 和 FastAPI 服务，加载最新代码$(NC)"
+	@$(MAKE) restart
 	@echo ""
 	@echo "$(YELLOW)步骤 4/5: 等待服务就绪$(NC)"
 	@$(MAKE) wait
@@ -152,7 +153,7 @@ up:
 		docker ps --filter "name=milvus" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -10; \
 	else \
 		echo "$(YELLOW)🚀 启动 Milvus 相关容器...$(NC)"; \
-		docker compose -f vector-database.yml up -d; \
+		docker compose -f vector-database.yml up -d etcd minio standalone attu; \
 		echo "$(YELLOW)⏳ 等待容器启动...$(NC)"; \
 		sleep 5; \
 		if docker ps --format '{{.Names}}' | grep -q "^$(MILVUS_CONTAINER)$$"; then \
@@ -525,7 +526,7 @@ upload:
 			count=$$((count + 1)); \
 			filename=$$(basename "$$file"); \
 			echo "$(YELLOW)  [$$count] 上传文件: $$filename$(NC)"; \
-			response=$$($(CURL) -s -w "\n%{http_code}" -X POST $(UPLOAD_API) \
+			response=$$($(UPLOAD_CURL) -s -w "\n%{http_code}" -X POST $(UPLOAD_API) \
 				-F "file=@$$file" \
 				-H "Accept: application/json"); \
 			http_code=$$(echo "$$response" | tail -n1); \
@@ -547,6 +548,12 @@ upload:
 	echo "   $(GREEN)成功: $$success$(NC)"; \
 	if [ $$failed -gt 0 ]; then \
 		echo "   $(RED)失败: $$failed$(NC)"; \
+		echo "$(RED)❌ 有文档上传失败，请查看 server.log 中的上传/向量化错误$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ $$count -eq 0 ]; then \
+		echo "$(RED)❌ 没有找到可上传的 Markdown 文件$(NC)"; \
+		exit 1; \
 	fi
 
 # 列出文档
@@ -564,10 +571,10 @@ test-upload:
 	@first_file=$$(ls $(DOCS_DIR)/*.md 2>/dev/null | head -n1); \
 	if [ -n "$$first_file" ]; then \
 		echo "$(YELLOW)上传文件: $$first_file$(NC)"; \
-		$(CURL) -X POST $(UPLOAD_API) \
+		$(UPLOAD_CURL) -X POST $(UPLOAD_API) \
 			-F "file=@$$first_file" \
 			-H "Accept: application/json" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin), indent=2, ensure_ascii=False))" 2>/dev/null || \
-			$(CURL) -X POST $(UPLOAD_API) -F "file=@$$first_file"; \
+			$(UPLOAD_CURL) -X POST $(UPLOAD_API) -F "file=@$$first_file"; \
 	else \
 		echo "$(RED)测试文件不存在$(NC)"; \
 	fi
@@ -708,3 +715,29 @@ logs:  ## 查看服务日志
 		echo "$(RED)日志文件不存在$(NC)"; \
 		echo "$(YELLOW)提示: 使用 make start 启动服务后会生成日志$(NC)"; \
 	fi
+
+# Strict Prometheus startup used by init. Fails fast and prints container logs.
+prometheus-up-checked:
+	@echo "$(YELLOW)Starting Prometheus with health check...$(NC)"
+	@if ! docker info > /dev/null 2>&1; then \
+		echo "$(RED)Docker is not running. Please start Docker first.$(NC)"; \
+		exit 1; \
+	fi
+	@if [ ! -f "monitoring/prometheus.yml" ] || [ ! -f "monitoring/alert_rules.yml" ]; then \
+		echo "$(RED)Prometheus config files are missing: monitoring/prometheus.yml or monitoring/alert_rules.yml$(NC)"; \
+		exit 1; \
+	fi
+	@docker compose -f vector-database.yml up -d prometheus
+	@for i in $$(seq 1 30); do \
+		if $(CURL) -s -f $(PROMETHEUS_URL)/-/healthy > /dev/null 2>&1; then \
+			echo "$(GREEN)Prometheus is healthy: $(PROMETHEUS_URL)$(NC)"; \
+			exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	echo "$(RED)Prometheus failed to become healthy: $(PROMETHEUS_URL)$(NC)"; \
+	echo "$(YELLOW)Container status:$(NC)"; \
+	docker ps -a --filter "name=$(PROMETHEUS_CONTAINER)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"; \
+	echo "$(YELLOW)Recent Prometheus logs:$(NC)"; \
+	docker logs --tail 80 $(PROMETHEUS_CONTAINER) 2>/dev/null || true; \
+	exit 1

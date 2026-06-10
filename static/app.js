@@ -693,7 +693,14 @@ class SuperBizAgentApp {
             });
 
             if (!response.ok) {
-                throw new Error(`HTTP错误: ${response.status}`);
+                let errorMessage = `HTTP错误: ${response.status}`;
+                try {
+                    const errorData = await response.json();
+                    errorMessage = errorData.detail || errorData.message || errorMessage;
+                } catch (parseError) {
+                    // 保留 HTTP 状态错误即可
+                }
+                throw new Error(errorMessage);
             }
 
             const data = await response.json();
@@ -1139,7 +1146,14 @@ class SuperBizAgentApp {
             });
 
             if (!response.ok) {
-                throw new Error(`HTTP错误: ${response.status}`);
+                let errorMessage = `HTTP错误: ${response.status}`;
+                try {
+                    const errorData = await response.json();
+                    errorMessage = errorData.detail || errorData.message || errorMessage;
+                } catch (parseError) {
+                    // 保留 HTTP 状态错误即可
+                }
+                throw new Error(errorMessage);
             }
 
             const data = await response.json();
